@@ -12,6 +12,7 @@ from pygfx.utils.viewport import Viewport
 from preprocess import preprocess
 from signed_distance_functions import build_sdfs
 from meshing import build_all_meshes, build_mesh, MESHER_CAPABILITIES, DEFAULT_BREP_DEFLECTION
+from brep import build_many_brep_meshes
 from bounding_box import compute_all_world_bboxes, component_dependency_signature
 from gui_helpers import group_meshes_by_material, is_vacuum_material, assign_default_color
 import argparse
@@ -124,8 +125,25 @@ def compute_mesh_data(
             world_bboxes=world_bboxes,
         )
     else:
-        for name in new_dependencies:
-            if new_dependencies[name] != (dependencies or {}).get(name):
+        changed_names = [
+            name for name in new_dependencies
+            if new_dependencies[name] != (dependencies or {}).get(name)
+        ]
+        if verbose:
+            for name in changed_names:
+                print(f"Rebuilding {name}")
+        if mesher == "brep":
+            # Each changed component's boolean-cut chain is independent -
+            # fan them out across worker processes instead of rebuilding
+            # one at a time (see build_many_brep_meshes).
+            meshes.update(
+                build_many_brep_meshes(
+                    changed_names, union_geometries, world_matrices, clip,
+                    verbose, deflection=deflection, world_bboxes=world_bboxes,
+                )
+            )
+        else:
+            for name in changed_names:
                 meshes = rebuild_mesh(
                     meshes,
                     name,
@@ -139,8 +157,6 @@ def compute_mesh_data(
                     deflection=deflection,
                     world_bboxes=world_bboxes,
                 )
-                if verbose:
-                    print(f"Rebuilding {name}")
     dependencies = new_dependencies
 
     # One entry per component, or per material if grouped (trimesh

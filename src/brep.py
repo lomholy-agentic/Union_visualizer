@@ -27,6 +27,8 @@ from OCC.Core.TopAbs import TopAbs_SHELL
 from OCC.Core.TopoDS import Shell as topods_Shell
 import trimesh
 import numpy as np
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from preprocess import box_dimensions
 from bounding_box import compute_all_world_bboxes, overlapping
@@ -398,19 +400,135 @@ def build_single_brep_mesh(
     return mesh
 
 
-def build_brep_meshes(
-    union_geometries, world_matrices, clip, verbose, deflection=0.01,
-    world_bboxes=None,
+_CLASS_SPEC_ATTRS = (
+    "parameter_names", "parameter_defaults", "parameter_types",
+    "parameter_units", "parameter_comments", "category", "line_limit",
+)
+
+
+def _component_class_spec(comp):
+    """Plain-data (str/list/dict/int only) snapshot of the attributes
+    mcstasscript's own dynamic class construction assigns - see
+    _register_component_classes for why this has to be plain data rather
+    than the Component instance itself."""
+    return {attr: getattr(comp, attr) for attr in _CLASS_SPEC_ATTRS}
+
+
+def _register_component_classes(class_specs):
+    """Runs once in each freshly spawned worker process, before it accepts
+    any real task. mcstasscript represents each Union_* component as a
+    class it creates *dynamically* at parse time (McStas_instr's
+    _create_component_instance), registering it into
+    mcstasscript.interface.instr's own module globals so a Component
+    instance of that type can be pickled - but that registration only
+    happens in whichever process actually parses an instrument file. A
+    worker spawned by this pool never does that itself, so without this,
+    unpickling a Component instance sent to it fails with an AttributeError
+    ("module ... has no attribute 'Union_box'"). This recreates an
+    equivalent class, matching mcstasscript's own construction, from a
+    plain-data spec built by _component_class_spec - it can't take a live
+    sample Component instead, because that instance would itself need to be
+    pickled to reach this initializer, hitting the same problem one level
+    earlier (unpickling the process's own spawn payload).
+    """
+    import mcstasscript.interface.instr as msi
+
+    for component_name, spec in class_specs.items():
+        if hasattr(msi, component_name):
+            continue
+        input_dict = {key: None for key in spec["parameter_names"]}
+        input_dict.update(spec)
+        setattr(msi, component_name, type(component_name, (msi.Component,), input_dict))
+
+
+# Reused across calls rather than recreated per call, so the worker
+# processes are spawned once (lazily, on first submit) and stay warm across
+# reloads instead of paying process-startup cost every time. Rebuilt (see
+# below) if a later call needs a component type its workers don't know
+# about yet - e.g. after switching to a different instrument.
+_mesh_build_pool = None
+_mesh_build_pool_component_types = frozenset()
+
+
+def _get_mesh_build_pool(union_geometries):
+    global _mesh_build_pool, _mesh_build_pool_component_types
+
+    sample_components = {}
+    for comp in union_geometries.values():
+        sample_components.setdefault(comp.component_name, comp)
+    needed_types = frozenset(sample_components)
+
+    if _mesh_build_pool is not None and not needed_types.issubset(
+        _mesh_build_pool_component_types
+    ):
+        _mesh_build_pool.shutdown(wait=True)
+        _mesh_build_pool = None
+
+    if _mesh_build_pool is None:
+        class_specs = {
+            name: _component_class_spec(comp)
+            for name, comp in sample_components.items()
+        }
+        _mesh_build_pool = ProcessPoolExecutor(
+            max_workers=os.cpu_count() or 1,
+            initializer=_register_component_classes,
+            initargs=(class_specs,),
+        )
+        _mesh_build_pool_component_types = needed_types
+
+    return _mesh_build_pool
+
+
+def build_many_brep_meshes(
+    names, union_geometries, world_matrices, clip, verbose, deflection=0.01,
+    world_bboxes=None, max_workers=None,
 ):
+    """Build the brep mesh for each of `names` (a subset of, or all of,
+    union_geometries). Every component's build is independent of every
+    other component's - build_single_brep_mesh only ever reads *other*
+    components' cheaply-rebuilt primitive shapes, never another
+    component's finished mesh - so this fans them out across worker
+    processes instead of building one at a time. Real OS processes, not
+    threads: pythonocc-core/OpenCASCADE calls don't release the GIL, so a
+    thread pool would just serialize on it and gain nothing.
+    """
     if world_bboxes is None:
         world_bboxes = compute_all_world_bboxes(union_geometries, world_matrices)
 
-    meshes_dict = {}
+    names = list(names)
+    if max_workers is None:
+        max_workers = os.cpu_count() or 1
+    max_workers = min(max_workers, len(names))
 
-    for name, comp in union_geometries.items():
-        mesh = build_single_brep_mesh(
-            comp, union_geometries, world_matrices, clip, verbose,
-            deflection=deflection, world_bboxes=world_bboxes,
-        )
-        meshes_dict[name] = mesh
+    if max_workers <= 1:
+        return {
+            name: build_single_brep_mesh(
+                union_geometries[name], union_geometries, world_matrices, clip,
+                verbose, deflection=deflection, world_bboxes=world_bboxes,
+            )
+            for name in names
+        }
+
+    pool = _get_mesh_build_pool(union_geometries)
+    futures = {
+        pool.submit(
+            build_single_brep_mesh,
+            union_geometries[name], union_geometries, world_matrices, clip,
+            verbose, deflection, world_bboxes,
+        ): name
+        for name in names
+    }
+    meshes_dict = {}
+    for future in as_completed(futures):
+        meshes_dict[futures[future]] = future.result()
     return meshes_dict
+
+
+def build_brep_meshes(
+    union_geometries, world_matrices, clip, verbose, deflection=0.01,
+    world_bboxes=None, max_workers=None,
+):
+    return build_many_brep_meshes(
+        union_geometries.keys(), union_geometries, world_matrices, clip, verbose,
+        deflection=deflection, world_bboxes=world_bboxes, max_workers=max_workers,
+    )

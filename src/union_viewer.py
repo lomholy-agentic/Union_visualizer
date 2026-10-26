@@ -941,14 +941,14 @@ class Viewer(QtWidgets.QMainWindow):
         self.cut = None
         info = ""
         if selection is not None:
-            start, end, keep_from, keep_to = selection
+            start, end, keep = selection
             order = self.component_order
             if order.index(start) >= order.index(end):
                 info = "'To' must come after 'From'."
             elif start not in self.world_matrices or end not in self.world_matrices:
                 info = "Could not place 'From' or 'To'."
             else:
-                shift = cut_shift(self.world_matrices, start, end, keep_from + keep_to)
+                shift = cut_shift(self.world_matrices, start, end, keep)
                 self.cut = (cut_sides(order, start, end), shift)
                 info = f"Removed {np.linalg.norm(shift):.4g} m."
 
@@ -968,19 +968,18 @@ class Viewer(QtWidgets.QMainWindow):
             self.cut_marker = None
         if self.cut is None:
             return
-        _, end, keep_from, keep_to = selection
+        _, end, keep = selection
         shift = self.cut[1]
         removed = np.linalg.norm(shift)
         if removed == 0:
             return
         direction = shift / removed
         end_position = self.world_matrices[end][:3, 3]
-        # ponytail: marker sized by the kept distance, not by the geometry
-        # around it.
+        # ponytail: marker sized by keep, not by the geometry around it.
         self.cut_marker = build_cut_marker(
-            end_position - direction * keep_to,
+            end_position - direction * keep / 2,
             direction,
-            max(keep_from + keep_to, CUT_MARKER_MIN_SIZE),
+            max(keep, CUT_MARKER_MIN_SIZE),
             f"-{removed:.4g} m",
         )
         self.scene.add(self.cut_marker)

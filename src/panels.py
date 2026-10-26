@@ -467,8 +467,8 @@ class ClippingPanel(QtWidgets.QWidget):
 
 class CutPanel(QtWidgets.QWidget):
     """Collapsing the gap between two components: on/off, the 'From' and
-    'To' components and the distances to keep after 'From' and before
-    'To'. changed() is emitted whenever any of them changes."""
+    'To' components and the distance to keep between them. changed() is
+    emitted whenever any of them changes."""
 
     changed = QtCore.Signal()
 
@@ -480,9 +480,8 @@ class CutPanel(QtWidgets.QWidget):
             "Collapse gap",
             tooltip=(
                 "Move every component up to and including 'From' along the "
-                "line to 'To' until only the two kept distances separate "
-                "them, and hide the components in between. The break is "
-                "marked where the two kept distances meet. Shapes and angles on each "
+                "line to 'To' until only 'Keep' metres separate them, and "
+                "hide the components in between. Shapes and angles on each "
                 "side stay true; only rays crossing the gap (drawn dashed) "
                 "are shortened. STL export keeps true positions but leaves "
                 "the hidden components out."
@@ -496,16 +495,12 @@ class CutPanel(QtWidgets.QWidget):
             combo.addItem("-", None)
             add_labeled_row(layout, text, combo)
 
-        self.keep_spins = {}
-        for key, text, tooltip in (
-            ("from", "Keep after From", "Distance kept between 'From' and the break."),
-            ("to", "Keep before To", "Distance kept between the break and 'To'."),
-        ):
-            spin = make_double_spin(0.0, 1e6, 1.0, decimals=3, step=0.1, tooltip=tooltip)
-            spin.setSuffix(" m")
-            add_labeled_row(layout, text, spin)
-            spin.valueChanged.connect(self._on_changed)
-            self.keep_spins[key] = spin
+        self.keep_spin = make_double_spin(
+            0.0, 1e6, 2.0, decimals=3, step=0.1,
+            tooltip="Distance left between 'From' and 'To'.",
+        )
+        self.keep_spin.setSuffix(" m")
+        add_labeled_row(layout, "Keep", self.keep_spin)
 
         self.info_label = make_note_label()
         layout.addWidget(self.info_label)
@@ -513,6 +508,7 @@ class CutPanel(QtWidgets.QWidget):
         self.enable_checkbox.stateChanged.connect(self._on_changed)
         self.from_combo.currentIndexChanged.connect(self._on_changed)
         self.to_combo.currentIndexChanged.connect(self._on_changed)
+        self.keep_spin.valueChanged.connect(self._on_changed)
 
     def set_components(self, names):
         """Offer each component name, keeping the selections that still
@@ -525,12 +521,11 @@ class CutPanel(QtWidgets.QWidget):
             self._on_changed()
 
     def selection(self):
-        """(start, end, keep_after_start, keep_before_end), or None while
-        switched off or unset."""
+        """(start, end, keep), or None while switched off or unset."""
         start, end = self.from_combo.currentData(), self.to_combo.currentData()
         if not self.enable_checkbox.isChecked() or start is None or end is None:
             return None
-        return start, end, self.keep_spins["from"].value(), self.keep_spins["to"].value()
+        return start, end, self.keep_spin.value()
 
     def _on_changed(self, *_):
         self.changed.emit()

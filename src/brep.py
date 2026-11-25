@@ -8,7 +8,7 @@ from OCC.Core.gp import gp_Ax2, gp_Pnt, gp_Dir
 from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
 from OCC.Core.TopExp import TopExp_Explorer
 from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_REVERSED
-from OCC.Core.BRep import BRep_Tool
+from OCC.Core.BRep import BRep_Builder, BRep_Tool
 from OCC.Core.TopLoc import TopLoc_Location
 from OCC.Core.gp import gp_Pln
 from OCC.Core.BRepBuilderAPI import (
@@ -24,7 +24,7 @@ from OCC.Core.BRepAlgoAPI import (
 )
 from OCC.Core.BRepOffsetAPI import BRepOffsetAPI_ThruSections
 from OCC.Core.TopAbs import TopAbs_SHELL
-from OCC.Core.TopoDS import Shell as topods_Shell
+from OCC.Core.TopoDS import TopoDS_Compound, Shell as topods_Shell
 import trimesh
 import numpy as np
 import os
@@ -64,8 +64,16 @@ def _mesh_to_brep(mesh, name, verbose=False):
     sewing.Perform()
     shape = sewing.SewedShape()
 
-    if shape.ShapeType() != TopAbs_SHELL:
-        # Sewing didn't produce a single closed shell (e.g. a non-watertight
+    # A mesh of several separate bodies sews into a compound of shells:
+    # each shell becomes its own solid, collected in a compound of solids.
+    shells = []
+    explorer = TopExp_Explorer(shape, TopAbs_SHELL)
+    while explorer.More():
+        shells.append(topods_Shell(explorer.Current()))
+        explorer.Next()
+
+    if not shells:
+        # Sewing didn't produce any closed shell (e.g. a non-watertight
         # mesh) - fall back to the sewn shape as-is rather than raising, so
         # a slightly-open mesh still degrades gracefully.
         if verbose:
@@ -73,13 +81,24 @@ def _mesh_to_brep(mesh, name, verbose=False):
                   f"using the sewn shape as-is.")
         return shape
 
-    solid_maker = BRepBuilderAPI_MakeSolid(topods_Shell(shape))
-    if not solid_maker.IsDone():
-        if verbose:
-            print(f"Warning: could not close mesh '{name}' into a solid; "
-                  f"using the sewn shell as-is.")
-        return shape
-    return solid_maker.Solid()
+    solids = []
+    for shell in shells:
+        solid_maker = BRepBuilderAPI_MakeSolid(shell)
+        if not solid_maker.IsDone():
+            if verbose:
+                print(f"Warning: could not close mesh '{name}' into a solid; "
+                      f"using the sewn shape as-is.")
+            return shape
+        solids.append(solid_maker.Solid())
+
+    if len(solids) == 1:
+        return solids[0]
+    compound = TopoDS_Compound()
+    builder = BRep_Builder()
+    builder.MakeCompound(compound)
+    for solid in solids:
+        builder.Add(compound, solid)
+    return compound
 
 
 def _rectangle_wire(center, x_dir, y_dir, width, height):

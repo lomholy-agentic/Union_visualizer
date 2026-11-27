@@ -16,17 +16,31 @@ def _plane_basis(normal):
     return np.stack([u, np.cross(normal, u)])
 
 
-def _triangles_overlap(a, b, eps):
-    """Do two 2D triangles (3, 2) overlap with positive area? Separating axis
-    test over the six edge normals; touching along an edge is not overlap."""
-    for tri in (a, b):
-        edges = np.roll(tri, -1, axis=0) - tri
-        for axis in np.column_stack([-edges[:, 1], edges[:, 0]]):
-            pa, pb = a @ axis, b @ axis
-            gap = eps * np.linalg.norm(axis)
-            if pa.max() <= pb.min() + gap or pb.max() <= pa.min() + gap:
-                return False
-    return True
+def _overlapping(a, b, eps):
+    """For paired 2D triangles a[k], b[k] (k, 3, 2): do they overlap with positive
+    area? Separating axis test over the six edge normals; touching along an edge
+    is not overlap."""
+    edges = np.concatenate([np.roll(a, -1, axis=1) - a, np.roll(b, -1, axis=1) - b], axis=1)
+    axes = np.stack([-edges[..., 1], edges[..., 0]], axis=-1)
+    pa, pb = np.einsum("kvd,kad->kav", a, axes), np.einsum("kvd,kad->kav", b, axes)
+    gap = eps * np.linalg.norm(axes, axis=2)
+    separated = (pa.max(2) <= pb.min(2) + gap) | (pb.max(2) <= pa.min(2) + gap)
+    return ~separated.any(1)
+
+
+def _any_overlap(a, b, eps):
+    """Does any 2D triangle of a (n, 3, 2) overlap one of b (m, 3, 2)? Only pairs
+    whose bounding boxes meet within eps are tested."""
+    blo, bhi = b.min(1), b.max(1)
+    # about 4M box pairs per pass
+    chunk = max(1, (1 << 22) // len(b))
+    for s in range(0, len(a), chunk):
+        part = a[s:s + chunk]
+        lo, hi = part.min(1), part.max(1)
+        i, j = np.nonzero(np.all((lo[:, None] <= bhi[None] + eps) & (blo[None] <= hi[:, None] + eps), axis=2))
+        if len(i) and _overlapping(part[i], b[j], eps).any():
+            return True
+    return False
 
 
 def find_coincident_faces(meshes, tol=1e-9):
@@ -65,11 +79,9 @@ def find_coincident_faces(meshes, tol=1e-9):
             continue
         normal, offset = planes[key]
         basis = _plane_basis(normal)
-        flat = {n: [t @ basis.T for t in per_mesh[n]] for n in names}
+        flat = {n: np.array(per_mesh[n]) @ basis.T for n in names}
         for i, a in enumerate(names):
             for b in names[i + 1:]:
-                # ponytail: all triangle pairs in one plane, O(n*m); add a 2D
-                # grid if huge flat meshes get slow.
-                if any(_triangles_overlap(ta, tb, tol) for ta in flat[a] for tb in flat[b]):
+                if _any_overlap(flat[a], flat[b], tol):
                     found[a, b].append((normal, offset))
     return [(a, b, shared) for (a, b), shared in sorted(found.items())]
